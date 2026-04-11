@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -8,24 +10,42 @@ using System.Reflection;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading.Tasks;
+using System.Linq;
+using System.ComponentModel;
+using System.Windows.Data;
 using Microsoft.Toolkit.Uwp.Notifications;
 
 namespace BASpark
 {
+    public class ProcessItem
+    {
+        // 加上 = string.Empty 解决 CS8618 警告
+        public string DisplayName { get; set; } = string.Empty;
+        public string ProcessName { get; set; } = string.Empty;
+        public bool IsSelected { get; set; }
+    }
+
     public partial class ControlPanelWindow : Window
     {
         private DispatcherTimer _refreshTimer;
         private DispatcherTimer _noticeTimer;
         private bool _isCheckingUpdate = false;
 
+        public ObservableCollection<ProcessItem> ProcessList { get; set; } = new ObservableCollection<ProcessItem>();
+
         public ControlPanelWindow()
         {
             InitializeComponent();
+            
+            if (ListProcessSelection != null)
+            {
+                ListProcessSelection.ItemsSource = ProcessList;
+            }
+
             LoadVersion();
             LoadSettings();
             LoadRemoteNotice();
             
-            // 启动时自动静默检查更新
             _ = CheckForUpdates(isManual: false);
 
             _refreshTimer = new DispatcherTimer();
@@ -39,11 +59,9 @@ namespace BASpark
             _noticeTimer.Start();
         }
 
-        // 检查更新核心逻辑
         private async Task CheckForUpdates(bool isManual)
         {
             string updateUrl = "https://qq.catbotstudio.top/update.json"; 
-
             try
             {
                 using HttpClient client = new HttpClient();
@@ -104,24 +122,20 @@ namespace BASpark
         private async void CheckUpdate_Click(object sender, RoutedEventArgs e)
         {
             if (_isCheckingUpdate) return;
-
             var btn = sender as System.Windows.Controls.Button;
             try
             {
                 _isCheckingUpdate = true;
-                
                 if (btn != null)
                 {
                     btn.IsEnabled = false;
                     btn.Content = "正在检查..."; 
                 }
-
                 await CheckForUpdates(isManual: true);
             }
             finally
             {
                 _isCheckingUpdate = false;
-                
                 if (btn != null)
                 {
                     btn.IsEnabled = true;
@@ -133,22 +147,18 @@ namespace BASpark
         private async void LoadRemoteNotice()
         {
             string noticeUrl = "https://qq.catbotstudio.top/notice.json";
-
             try
             {
                 using HttpClient client = new HttpClient();
                 client.Timeout = TimeSpan.FromSeconds(5);
                 client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BASparkClient/1.0");
-
                 string json = await client.GetStringAsync(noticeUrl);
-
                 using JsonDocument doc = JsonDocument.Parse(json);
                 JsonElement root = doc.RootElement;
 
                 string title = root.GetProperty("title").GetString() ?? "官方公告";
                 string content = root.GetProperty("content").GetString() ?? "";
                 string date = root.GetProperty("date").GetString() ?? "";
-
                 string lastContent = ConfigManager.LastNoticeContent;
 
                 Dispatcher.Invoke(() =>
@@ -159,7 +169,6 @@ namespace BASpark
                         NoticeContent.Text = content;
                         NoticeDate.Text = date;
                         NoticeBar.Visibility = Visibility.Visible;
-
                         if (content != lastContent)
                         {
                             ShowWindowsNotification(title, content);
@@ -184,10 +193,7 @@ namespace BASpark
         {
             try
             {
-                new ToastContentBuilder()
-                    .AddText(title)
-                    .AddText(content)
-                    .Show();
+                new ToastContentBuilder().AddText(title).AddText(content).Show();
             }
             catch (Exception ex)
             {
@@ -218,16 +224,90 @@ namespace BASpark
 
             if (StatusText != null)
             {
-                if (ConfigManager.IsEffectEnabled)
-                {
-                    StatusText.Text = "工作中 (Active)";
-                    StatusText.Foreground = System.Windows.Media.Brushes.Green;
-                }
-                else
+                bool suppressedByEnvironment = ConfigManager.IsEffectEnabled &&
+                    App.Overlay?.IsEffectSuppressedByEnvironment() == true;
+
+                if (!ConfigManager.IsEffectEnabled)
                 {
                     StatusText.Text = "已暂停 (Paused)";
                     StatusText.Foreground = System.Windows.Media.Brushes.Gray;
                 }
+                else if (suppressedByEnvironment)
+                {
+                    StatusText.Text = "环境过滤中 (Auto Hidden)";
+                    StatusText.Foreground = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xD9, 0x77, 0x06));
+                }
+                else
+                {
+                    StatusText.Text = "工作中 (Active)";
+                    StatusText.Foreground = System.Windows.Media.Brushes.Green;
+                }
+            }
+        }
+
+        private void RefreshProcessList_Click(object sender, RoutedEventArgs e)
+        {
+            RefreshProcessList();
+        }
+
+        private void RefreshProcessList()
+        {
+            var currentlySelected = ProcessList.Where(p => p.IsSelected).Select(p => p.ProcessName).ToList();
+            ProcessList.Clear();
+            try
+            {
+                var processes = Process.GetProcesses()
+                    .Where(p => !string.IsNullOrEmpty(p.MainWindowTitle))
+                    .OrderBy(p => p.ProcessName);
+
+                foreach (var p in processes)
+                {
+                    string pName = p.ProcessName + ".exe";
+                    if (ProcessList.Any(item => item.ProcessName.Equals(pName, StringComparison.OrdinalIgnoreCase))) continue;
+
+                    string dName = pName;
+                    try 
+                    { 
+                        // 使用 null 条件操作符解决 CS8600
+                        string? desc = p.MainModule?.FileVersionInfo.FileDescription;
+                        if (!string.IsNullOrWhiteSpace(desc)) dName = desc;
+                    } 
+                    catch { }
+
+                    ProcessList.Add(new ProcessItem
+                    {
+                        DisplayName = dName,
+                        ProcessName = pName,
+                        IsSelected = currentlySelected.Contains(pName, StringComparer.OrdinalIgnoreCase)
+                    });
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine(ex.Message); }
+        }
+
+        // 重点：显式指定 System.Windows.Controls.TextBox 解决 CS0104 冲突
+        private void SearchProcess_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            string? filter = (sender as System.Windows.Controls.TextBox)?.Text;
+            ICollectionView view = CollectionViewSource.GetDefaultView(ProcessList);
+            if (view == null) return;
+
+            if (string.IsNullOrWhiteSpace(filter))
+            {
+                view.Filter = null;
+            }
+            else
+            {
+                view.Filter = obj =>
+                {
+                    // 增加 null 检查解决 CS8602
+                    if (obj is ProcessItem item)
+                    {
+                        return item.DisplayName.Contains(filter, StringComparison.OrdinalIgnoreCase) ||
+                               item.ProcessName.Contains(filter, StringComparison.OrdinalIgnoreCase);
+                    }
+                    return false;
+                };
             }
         }
 
@@ -238,9 +318,33 @@ namespace BASpark
             CheckStartSilent.IsChecked = ConfigManager.StartSilent;
             CheckTelemetry.IsChecked = ConfigManager.EnableTelemetry;
             CheckAlwaysTrailEffectSwitch.IsChecked = ConfigManager.EnableAlwaysTrailEffect;
-            UpdateColorPreview(ConfigManager.ParticleColor);
+            CheckEnvironmentFilter.IsChecked = ConfigManager.EnableEnvironmentFilter;
+            CheckHideInFullscreen.IsChecked = ConfigManager.HideInFullscreen;
+            SelectProcessFilterMode(ConfigManager.ProcessFilterMode);
+            
+            string savedList = ConfigManager.ProcessFilterList ?? "";
+            var savedNames = savedList.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                                      .Select(s => s.Trim()).ToList();
 
+            RefreshProcessList();
+
+            foreach (var name in savedNames)
+            {
+                var existing = ProcessList.FirstOrDefault(p => p.ProcessName.Equals(name, StringComparison.OrdinalIgnoreCase));
+                if (existing == null)
+                {
+                    // 补全 DisplayName 逻辑
+                    ProcessList.Insert(0, new ProcessItem { DisplayName = name, ProcessName = name, IsSelected = true });
+                }
+                else
+                {
+                    existing.IsSelected = true;
+                }
+            }
+
+            UpdateColorPreview(ConfigManager.ParticleColor);
             UpdateStartSilentInterlock();
+            UpdateEnvironmentFilterInterlock();
 
             SliderScale.Value = ConfigManager.EffectScale;
             SliderOpacity.Value = ConfigManager.EffectOpacity;
@@ -258,6 +362,53 @@ namespace BASpark
         {
             bool autoStartEnabled = CheckAutoStart.IsChecked == true;
             CheckStartSilent.IsEnabled = autoStartEnabled;
+        }
+
+        private void EnvironmentFilterSetting_Changed(object sender, RoutedEventArgs e)
+        {
+            if (!IsLoaded) return;
+            UpdateEnvironmentFilterInterlock();
+        }
+
+        private void ProcessFilterMode_Changed(object sender, SelectionChangedEventArgs e)
+        {
+            if (!IsLoaded) return;
+            UpdateEnvironmentFilterInterlock();
+        }
+
+        private void UpdateEnvironmentFilterInterlock()
+        {
+            bool environmentFilterEnabled = CheckEnvironmentFilter.IsChecked == true;
+            ProcessFilterModeOption selectedMode = GetSelectedProcessFilterMode();
+            bool processFilterEnabled = environmentFilterEnabled && selectedMode != ProcessFilterModeOption.Disabled;
+
+            CheckHideInFullscreen.IsEnabled = environmentFilterEnabled;
+            ComboProcessFilterMode.IsEnabled = environmentFilterEnabled;
+            
+            if (ListProcessSelection != null)
+            {
+                ListProcessSelection.IsEnabled = processFilterEnabled;
+                ListProcessSelection.Opacity = processFilterEnabled ? 1.0 : 0.65;
+            }
+        }
+
+        private void SelectProcessFilterMode(ProcessFilterModeOption mode)
+        {
+            ComboBoxItem? selectedItem = ComboProcessFilterMode.Items
+                .OfType<ComboBoxItem>()
+                .FirstOrDefault(item => string.Equals(item.Tag?.ToString(), mode.ToString(), StringComparison.OrdinalIgnoreCase));
+
+            ComboProcessFilterMode.SelectedItem = selectedItem ?? ComboProcessFilterMode.Items[0];
+        }
+
+        private ProcessFilterModeOption GetSelectedProcessFilterMode()
+        {
+            if (ComboProcessFilterMode.SelectedItem is ComboBoxItem item &&
+                Enum.TryParse(item.Tag?.ToString(), true, out ProcessFilterModeOption mode))
+            {
+                return mode;
+            }
+            return ProcessFilterModeOption.Disabled;
         }
 
         private void UpdateEffectValueTexts()
@@ -346,6 +497,11 @@ namespace BASpark
             int trailRefreshRate = (int)Math.Round(SliderTrailRefresh.Value);
             bool autoStartEnabled = CheckAutoStart.IsChecked ?? false;
             bool startSilentEnabled = CheckStartSilent.IsChecked ?? false;
+            ProcessFilterModeOption processFilterMode = GetSelectedProcessFilterMode();
+            
+            string selectedProcesses = string.Join(Environment.NewLine, 
+                ProcessList.Where(p => p.IsSelected).Select(p => p.ProcessName));
+            string normalizedProcessFilterList = ConfigManager.NormalizeProcessFilterList(selectedProcesses);
 
             ConfigManager.Save("IsEffectEnabled", CheckMasterSwitch.IsChecked ?? true);
             ConfigManager.Save("AutoStart", autoStartEnabled);
@@ -358,12 +514,17 @@ namespace BASpark
             ConfigManager.Save("TotalClicks", ConfigManager.TotalClicks);
             ConfigManager.Save("EnableAlwaysTrailEffect", CheckAlwaysTrailEffectSwitch.IsChecked ?? false);
             ConfigManager.Save("StartSilent", startSilentEnabled);
+            ConfigManager.Save("EnableEnvironmentFilter", CheckEnvironmentFilter.IsChecked ?? false);
+            ConfigManager.Save("HideInFullscreen", CheckHideInFullscreen.IsChecked ?? true);
+            ConfigManager.Save("ProcessFilterMode", processFilterMode.ToString());
+            ConfigManager.Save("ProcessFilterList", normalizedProcessFilterList);
 
             App.SetAutoStart(ConfigManager.AutoStart);
 
             App.Overlay?.UpdateColor(ConfigManager.ParticleColor);
             App.Overlay?.UpdateEffectSettings(effectScale, effectOpacity, effectSpeed);
             App.Overlay?.UpdateTrailRefreshRate(trailRefreshRate);
+            App.Overlay?.RefreshEnvironmentFilterState();
 
             System.Windows.MessageBox.Show("配置已成功应用！", "BASpark", MessageBoxButton.OK, MessageBoxImage.Information);
         }
